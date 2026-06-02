@@ -1,61 +1,82 @@
+# backend/app/services/rag_service.py
 import logging
 import textwrap
-from typing import List, Dict
+from typing import List, Dict, Tuple
+from google import genai
+from google.genai import types
+
 from ..config import settings
 from ..models import UserContext
 from .vector_store import VectorStoreFactory
-import google.generativeai as genai
 
 logger = logging.getLogger(__name__)
 
 
 class RAGService:
     def __init__(self):
-        genai.configure(api_key=settings.GEMINI_API_KEY)
+        # Natively instantiate the Google GenAI client object
+        self.client = genai.Client(api_key=settings.GEMINI_API_KEY)
         self.vector_store = VectorStoreFactory.create(settings.VECTOR_PROVIDER)
 
-    async def retrieve(self, query: str, user_ctx: UserContext, top_k: int = 5):
-        # In a real system we'd compute embeddings using Gemini embeddings model
-        # For determinism here we'll skip embedding similarity and use vector_store.query
+    async def retrieve(self, query: str, user_ctx: UserContext, top_k: int = 5) -> List[Dict]:
+        """
+        Retrieves matching HR document chunks using strict RBAC metadata filters.
+        """
         metadata_filter = {
             'department': user_ctx.department,
             'location': user_ctx.location,
             'role_level': user_ctx.role_level,
         }
-        # placeholder embedding
+        
+        # Placeholder embedding logic matched to your provider payload layout
+        # (In production, replace with: self.client.models.embed_content)
         embedding = [0.0]
         hits = await self.vector_store.query(embedding, top_k=top_k, metadata_filter=metadata_filter)
         return hits
 
-    async def generate_answer(self, query: str, user_ctx: UserContext, retrieved_chunks: List[Dict]):
-        # Build deterministic system prompt with citation formatting requirement
+    async def generate_answer(self, query: str, user_ctx: UserContext, retrieved_chunks: List[Dict]) -> Tuple[List[str], List[Dict]]:
+        """
+        Assembles context and streams production-safe responses with strict structural citations.
+        """
+        # Build strict system rules for safe HR reasoning
         system_prompt = textwrap.dedent(f"""
         You are an enterprise HR assistant. Only answer questions based on the provided policy chunks.
-        Always include deterministic citations after facts in the format: [source:{'{source}'}|page:{'{page}'}|section:{'{section}'}].
+        Always include deterministic citations after facts in the format: .
         Do not hallucinate sources. If the answer is not contained in the chunks, respond with a safe refusal.
         User context: department={user_ctx.department}, location={user_ctx.location}, role_level={user_ctx.role_level}
         """)
 
-        # assemble retrieved text
-        context_text = "\n\n".join([f"[[{c['id']}]] {c['text']} (source={c['metadata'].get('source')},page={c['metadata'].get('page')})" for c in retrieved_chunks])
+        # Assemble retrieved content data blocks securely
+        context_text = "\n\n".join([
+            f"[[{c['id']}]] {c['text']} (source={c['metadata'].get('source')}, page={c['metadata'].get('page')}, section={c['metadata'].get('section')})" 
+            for c in retrieved_chunks
+        ])
 
-        prompt = f"{system_prompt}\n\nCONTEXT:\n{context_text}\n\nQUESTION:{query}\n\nAnswer concisely and include citation tokens."
+        user_prompt = f"CONTEXT:\n{context_text}\n\nQUESTION: {query}\n\nAnswer concisely and include citation tokens."
 
-        # Call Gemini chat model (synchronously) and return text.
-        resp = genai.chat.create(model='gemini-2.5-flash', messages=[{'role': 'system', 'content': system_prompt}, {'role': 'user', 'content': prompt}])
-        # Response content may be in resp.candidates[0].content
-        text = ''
+        # Modern unified model call using the canonical generation syntax
         try:
-            text = resp.last or resp.output or getattr(resp, 'candidates', [{}])[0].get('content', '')
-        except Exception:
-            text = str(resp)
+            response = self.client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=user_prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    temperature=0.2, # Low temperature ensures focused, analytical responses
+                )
+            )
+            text = response.text
+        except Exception as e:
+            logger.error(f"Gemini API failure: {str(e)}")
+            text = "I'm sorry — an internal error occurred while processing your query. Please contact HR support."
 
-        # If Gemini didn't return content, produce a safe fallback
-        if not text:
+        # Safe fallback logic if generation engine returns an empty text block
+        if not text or text.strip() == "":
             text = "I'm sorry — I couldn't find an answer to that within the allowed HR policy documents."
 
-        # For streaming we will chunk the response by sentences
-        chunks = [ch.strip() + ' ' for ch in text.split('. ') if ch]
-        # Build citation metadata list
+        # Package the full response text into discrete stream segments (split by sentences)
+        chunks = [ch.strip() + '. ' for ch in text.split('. ') if ch]
+        
+        # Extract metadata structures safely to return to the UI for citation chips
         citations = [c['metadata'] for c in retrieved_chunks]
+        
         return chunks, citations

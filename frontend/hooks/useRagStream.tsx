@@ -18,9 +18,21 @@ export default function useRagStream(){
     controllerRef.current = controller
 
     try{
+      // Build headers with optional dev-user injection for local testing
+      const token = localStorage.getItem('id_token') || ''
+      const devUser = process.env.NEXT_PUBLIC_DEV_USER || ''
+      const headers: Record<string,string> = {'Content-Type':'application/json'}
+      if(token){
+        headers['Authorization'] = 'Bearer ' + token
+      } else if(devUser){
+        // When running in dev and backend has DEV_AUTH_BYPASS=true, inject a dev user
+        headers['Authorization'] = 'Bearer dev'
+        headers['X-Dev-User'] = devUser
+      }
+
       const resp = await fetch(url, {
         method: 'POST',
-        headers: {'Content-Type':'application/json', 'Authorization': 'Bearer ' + (localStorage.getItem('id_token')||'')},
+        headers,
         body: JSON.stringify({query, top_k:5}),
         signal: controller.signal,
       })
